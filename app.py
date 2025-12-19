@@ -4,6 +4,8 @@ import pandas as pd
 from pathlib import Path
 import zipfile
 import re
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 # ===================== CONFIG ===================== #
 
@@ -12,8 +14,8 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/pdf"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/pdf,text/html"
 }
 
 # ===================== UI ===================== #
@@ -24,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("📚 DOI → Open Access PDF Downloader")
-st.caption("Downloads **legal Open Access PDFs only** using Unpaywall & PubMed Central")
+st.caption("Downloads **legal Open Access PDFs only** using Unpaywall, PMC & Publisher OA pages")
 
 doi_text = st.text_area(
     "Paste DOIs (one per line)",
@@ -42,18 +44,42 @@ def clean_doi(doi: str) -> str:
 def query_unpaywall(doi: str):
     url = f"https://api.unpaywall.org/v2/{doi}"
     params = {"email": UNPAYWALL_EMAIL}
-    r = requests.get(url, params=params, timeout=15)
-    if r.status_code == 200:
-        return r.json()
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
     return None
 
-def get_pdf_url(unpaywall_data):
+def extract_pdf_from_html(page_url: str):
     """
-    Robust OA PDF resolver:
-    - Checks best_oa_location
-    - Checks all oa_locations
-    - Converts PMC HTML → PDF
+    Extracts PDF link from publisher OA landing page
     """
+    try:
+        r = requests.get(page_url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # 1️⃣ citation_pdf_url (BEST)
+        meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
+        if meta and meta.get("content"):
+            return meta["content"]
+
+        # 2️⃣ Any .pdf link
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if ".pdf" in href.lower():
+                return urljoin(page_url, href)
+
+    except Exception:
+        pass
+
+    return None
+
+def get_pdf_or_landing(unpaywall_data):
     locations = []
 
     if unpaywall_data.get("best_oa_location"):
@@ -62,14 +88,14 @@ def get_pdf_url(unpaywall_data):
     locations.extend(unpaywall_data.get("oa_locations", []))
 
     for loc in locations:
-        # 1️⃣ Direct PDF
         if loc.get("url_for_pdf"):
-            return loc["url_for_pdf"], loc.get("host_type", "")
+            return loc["url_for_pdf"], "pdf"
 
-        # 2️⃣ PubMed Central HTML → PDF
-        url = loc.get("url", "")
-        if "ncbi.nlm.nih.gov/pmc/articles" in url:
-            return url.rstrip("/") + "/pdf", "pmc"
+        if loc.get("url"):
+            # PMC HTML → PDF
+            if "ncbi.nlm.nih.gov/pmc/articles" in loc["url"]:
+                return loc["url"].rstrip("/") + "/pdf", "pdf"
+            return loc["url"], "html"
 
     return None, None
 
@@ -83,7 +109,7 @@ def download_pdf(pdf_url: str, filepath: Path) -> str:
                 f.write(r.content)
             return "Downloaded"
         else:
-            return "Blocked or HTML page"
+            return "Blocked or HTML"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -119,18 +145,28 @@ if st.button("🔍 Check & Download PDFs"):
         data = query_unpaywall(doi)
 
         if data and data.get("is_oa"):
-            pdf_url, source = get_pdf_url(data)
+            url, url_type = get_pdf_or_landing(data)
 
-            if pdf_url:
+            if url:
                 record["OA"] = "Yes"
-                record["Source"] = source
-                record["PDF_URL"] = pdf_url
-
                 pdf_file = DOWNLOAD_DIR / f"{doi.replace('/', '_')}.pdf"
-                record["Download_Status"] = download_pdf(pdf_url, pdf_file)
-            else:
-                record["Download_Status"] = "OA but no PDF link"
 
+                if url_type == "pdf":
+                    record["Source"] = "Direct PDF"
+                    record["PDF_URL"] = url
+                    record["Download_Status"] = download_pdf(url, pdf_file)
+
+                else:
+                    record["Source"] = "Publisher OA Page"
+                    extracted_pdf = extract_pdf_from_html(url)
+
+                    if extracted_pdf:
+                        record["PDF_URL"] = extracted_pdf
+                        record["Download_Status"] = download_pdf(extracted_pdf, pdf_file)
+                    else:
+                        record["Download_Status"] = "OA page but PDF not found"
+            else:
+                record["Download_Status"] = "OA but no usable link"
         else:
             record["Download_Status"] = "Not Open Access"
 
@@ -169,7 +205,7 @@ if st.button("🔍 Check & Download PDFs"):
 st.markdown(
     """
     ---
-    **Data sources:** Unpaywall • PubMed Central  
-    **Compliance:** Open Access only (no Sci-Hub / Anna’s Archive)  
+    **Sources:** Unpaywall • PubMed Central • Publisher OA  
+    **Compliance:** 100% Legal Open Access (No Sci-Hub / Anna’s Archive)
     """
 )
