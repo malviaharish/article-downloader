@@ -170,6 +170,5 @@ st.markdown(
     """
     ---
     **Data sources:** Unpaywall • PubMed Central  
-    **Compliance:** Open Access only (no Sci-Hub / Anna’s Archive)  
-    """
+       """
 )
