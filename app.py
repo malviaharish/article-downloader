@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("📚 DOI → Open Access PDF Downloader")
-st.caption("Downloads **legal Open Access PDFs only** using Unpaywall, PMC & Publisher OA pages")
+st.caption("Downloads **legal Open Access PDFs only** using Unpaywall, PMC & publisher OA pages")
 
 doi_text = st.text_area(
     "Paste DOIs (one per line)",
@@ -53,9 +53,7 @@ def query_unpaywall(doi: str):
     return None
 
 def extract_pdf_from_html(page_url: str):
-    """
-    Extracts PDF link from publisher OA landing page
-    """
+    """Extract PDF link from publisher OA landing page"""
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
@@ -63,16 +61,15 @@ def extract_pdf_from_html(page_url: str):
 
         soup = BeautifulSoup(r.text, "lxml")
 
-        # 1️⃣ citation_pdf_url (BEST)
+        # Best option: citation_pdf_url
         meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
         if meta and meta.get("content"):
             return meta["content"]
 
-        # 2️⃣ Any .pdf link
+        # Fallback: any .pdf link
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if ".pdf" in href.lower():
-                return urljoin(page_url, href)
+            if ".pdf" in a["href"].lower():
+                return urljoin(page_url, a["href"])
 
     except Exception:
         pass
@@ -118,6 +115,23 @@ def zip_downloads(zip_path: Path):
         for pdf in DOWNLOAD_DIR.glob("*.pdf"):
             z.write(pdf, pdf.name)
 
+def make_clickable(url):
+    if not url:
+        return ""
+    return f"""
+    <a href="{url}" target="_blank"
+       style="
+           background:#2563eb;
+           color:white;
+           padding:6px 12px;
+           border-radius:6px;
+           text-decoration:none;
+           font-weight:600;
+       ">
+       Open PDF
+    </a>
+    """
+
 # ===================== MAIN LOGIC ===================== #
 
 if st.button("🔍 Check & Download PDFs"):
@@ -155,7 +169,6 @@ if st.button("🔍 Check & Download PDFs"):
                     record["Source"] = "Direct PDF"
                     record["PDF_URL"] = url
                     record["Download_Status"] = download_pdf(url, pdf_file)
-
                 else:
                     record["Source"] = "Publisher OA Page"
                     extracted_pdf = extract_pdf_from_html(url)
@@ -175,12 +188,21 @@ if st.button("🔍 Check & Download PDFs"):
 
     df = pd.DataFrame(results)
 
+    # Create clickable column
+    df["PDF_Link"] = df["PDF_URL"].apply(make_clickable)
+
     st.success("✅ Processing complete")
-    st.dataframe(df, use_container_width=True)
+
+    # Render clickable table
+    st.markdown(
+        df[["DOI", "OA", "Source", "PDF_Link", "Download_Status"]]
+        .to_html(escape=False, index=False),
+        unsafe_allow_html=True
+    )
 
     # ===================== EXPORTS ===================== #
 
-    csv_data = df.to_csv(index=False).encode("utf-8")
+    csv_data = df.drop(columns=["PDF_Link"]).to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download CSV Report",
         csv_data,
