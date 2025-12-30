@@ -217,11 +217,3 @@ if st.button("🔍 Check & Download PDFs"):
             )
 
 # ===================== FOOTER ===================== #
-
-st.markdown(
-    """
-    ---
-    **Sources:** Unpaywall • PubMed Central  
-    **Compliance:** 100% Legal Open Access  
-    """
-)
