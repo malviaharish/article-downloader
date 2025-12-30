@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 
 # ===================== CONFIG ===================== #
 
-UNPAYWALL_EMAIL = "your_email@institute.edu"   # REQUIRED
+UNPAYWALL_EMAIL = "your_real_email@institute.edu"   # REQUIRED
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -21,31 +21,54 @@ HEADERS = {
 # ===================== UI ===================== #
 
 st.set_page_config(
-    page_title="DOI → Open Access PDF Downloader",
+    page_title="DOI / PMID / PMCID → Open Access PDF Downloader",
     layout="wide"
 )
 
-st.title("📚 DOI → Open Access PDF Downloader")
-st.caption("Downloads **legal Open Access PDFs only** using Unpaywall, PMC & publisher OA pages")
+st.title("📚 DOI / PMID / PMCID → Open Access PDF Downloader")
+st.caption("Downloads **legal Open Access PDFs only** using Unpaywall & PubMed Central")
 
-doi_text = st.text_area(
-    "Paste DOIs (one per line)",
+id_text = st.text_area(
+    "Paste DOI / PMID / PMCID (one per line)",
     height=220,
-    placeholder="10.1000/j.jmb.2020.01.001"
+    placeholder="10.1000/j.jmb.2020.01.001\nPMID:12345678\nPMC1234567"
 )
 
-# ===================== FUNCTIONS ===================== #
+# ===================== HELPERS ===================== #
 
-def clean_doi(doi: str) -> str:
-    doi = doi.strip()
-    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
-    return doi
+def clean_id(val: str) -> str:
+    val = val.strip()
+    val = re.sub(r"^https?://(dx\.)?doi\.org/", "", val, flags=re.I)
+    return val.upper()
+
+def id_type(val: str) -> str:
+    if val.startswith("PMC"):
+        return "PMCID"
+    if val.startswith("PMID:") or val.isdigit():
+        return "PMID"
+    return "DOI"
+
+def id_crosswalk(val: str):
+    try:
+        r = requests.get(
+            "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/",
+            params={"ids": val, "format": "json"},
+            timeout=10
+        )
+        recs = r.json().get("records", [])
+        if recs:
+            return recs[0]
+    except Exception:
+        pass
+    return {}
 
 def query_unpaywall(doi: str):
-    url = f"https://api.unpaywall.org/v2/{doi}"
-    params = {"email": UNPAYWALL_EMAIL}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(
+            f"https://api.unpaywall.org/v2/{doi}",
+            params={"email": UNPAYWALL_EMAIL},
+            timeout=15
+        )
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -53,62 +76,30 @@ def query_unpaywall(doi: str):
     return None
 
 def extract_pdf_from_html(page_url: str):
-    """Extract PDF link from publisher OA landing page"""
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            return None
-
         soup = BeautifulSoup(r.text, "lxml")
 
-        # Best option: citation_pdf_url
         meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
         if meta and meta.get("content"):
             return meta["content"]
 
-        # Fallback: any .pdf link
         for a in soup.find_all("a", href=True):
             if ".pdf" in a["href"].lower():
                 return urljoin(page_url, a["href"])
-
     except Exception:
         pass
-
     return None
-
-def get_pdf_or_landing(unpaywall_data):
-    locations = []
-
-    if unpaywall_data.get("best_oa_location"):
-        locations.append(unpaywall_data["best_oa_location"])
-
-    locations.extend(unpaywall_data.get("oa_locations", []))
-
-    for loc in locations:
-        if loc.get("url_for_pdf"):
-            return loc["url_for_pdf"], "pdf"
-
-        if loc.get("url"):
-            # PMC HTML → PDF
-            if "ncbi.nlm.nih.gov/pmc/articles" in loc["url"]:
-                return loc["url"].rstrip("/") + "/pdf", "pdf"
-            return loc["url"], "html"
-
-    return None, None
 
 def download_pdf(pdf_url: str, filepath: Path) -> str:
     try:
         r = requests.get(pdf_url, headers=HEADERS, timeout=30)
-        content_type = r.headers.get("Content-Type", "").lower()
-
-        if r.status_code == 200 and "pdf" in content_type:
-            with open(filepath, "wb") as f:
-                f.write(r.content)
+        if r.status_code == 200:
+            filepath.write_bytes(r.content)
             return "Downloaded"
-        else:
-            return "Blocked or HTML"
-    except Exception as e:
-        return f"Error: {str(e)}"
+        return f"HTTP {r.status_code}"
+    except Exception:
+        return "Timeout / Blocked"
 
 def zip_downloads(zip_path: Path):
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -132,81 +123,84 @@ def make_clickable(url):
     </a>
     """
 
-# ===================== MAIN LOGIC ===================== #
+# ===================== MAIN ===================== #
 
 if st.button("🔍 Check & Download PDFs"):
 
-    raw_dois = [d for d in doi_text.splitlines() if d.strip()]
-    dois = [clean_doi(d) for d in raw_dois]
-
-    if not dois:
-        st.warning("Please paste at least one DOI.")
-        st.stop()
-
-    results = []
+    inputs = [clean_id(x) for x in id_text.splitlines() if x.strip()]
     progress = st.progress(0)
 
-    for i, doi in enumerate(dois):
+    results = []
+
+    for i, val in enumerate(inputs):
 
         record = {
-            "DOI": doi,
+            "Input": val,
+            "DOI": "",
+            "PMID": "",
+            "PMCID": "",
             "OA": "No",
             "Source": "",
             "PDF_URL": "",
             "Download_Status": ""
         }
 
-        data = query_unpaywall(doi)
+        # ---------- Resolve IDs ---------- #
+        idinfo = id_crosswalk(val)
+        record["DOI"] = idinfo.get("doi", "")
+        record["PMID"] = idinfo.get("pmid", "")
+        record["PMCID"] = idinfo.get("pmcid", "")
 
-        if data and data.get("is_oa"):
-            url, url_type = get_pdf_or_landing(data)
+        # ---------- PMC direct ---------- #
+        if record["PMCID"]:
+            pmc_pdf = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{record['PMCID']}/pdf"
+            record["OA"] = "Yes"
+            record["Source"] = "PubMed Central"
+            record["PDF_URL"] = pmc_pdf
+            pdf_file = DOWNLOAD_DIR / f"{record['PMCID']}.pdf"
+            record["Download_Status"] = download_pdf(pmc_pdf, pdf_file)
 
-            if url:
-                record["OA"] = "Yes"
-                pdf_file = DOWNLOAD_DIR / f"{doi.replace('/', '_')}.pdf"
+        # ---------- Unpaywall via DOI ---------- #
+        elif record["DOI"]:
+            up = query_unpaywall(record["DOI"])
+            if up and up.get("is_oa"):
+                loc = up.get("best_oa_location") or {}
+                pdf = loc.get("url_for_pdf") or extract_pdf_from_html(loc.get("url", ""))
 
-                if url_type == "pdf":
-                    record["Source"] = "Direct PDF"
-                    record["PDF_URL"] = url
-                    record["Download_Status"] = download_pdf(url, pdf_file)
+                if pdf:
+                    record["OA"] = "Yes"
+                    record["Source"] = "Unpaywall / Publisher"
+                    record["PDF_URL"] = pdf
+                    pdf_file = DOWNLOAD_DIR / f"{record['DOI'].replace('/', '_')}.pdf"
+                    record["Download_Status"] = download_pdf(pdf, pdf_file)
                 else:
-                    record["Source"] = "Publisher OA Page"
-                    extracted_pdf = extract_pdf_from_html(url)
-
-                    if extracted_pdf:
-                        record["PDF_URL"] = extracted_pdf
-                        record["Download_Status"] = download_pdf(extracted_pdf, pdf_file)
-                    else:
-                        record["Download_Status"] = "OA page but PDF not found"
+                    record["Download_Status"] = "OA but PDF not found"
             else:
-                record["Download_Status"] = "OA but no usable link"
+                record["Download_Status"] = "Not Open Access"
+
         else:
-            record["Download_Status"] = "Not Open Access"
+            record["Download_Status"] = "Identifier not resolved"
 
         results.append(record)
-        progress.progress((i + 1) / len(dois))
+        progress.progress((i + 1) / len(inputs))
 
     df = pd.DataFrame(results)
-
-    # Create clickable column
     df["PDF_Link"] = df["PDF_URL"].apply(make_clickable)
 
     st.success("✅ Processing complete")
 
-    # Render clickable table
     st.markdown(
-        df[["DOI", "OA", "Source", "PDF_Link", "Download_Status"]]
+        df[["Input", "DOI", "PMID", "PMCID", "OA", "Source", "PDF_Link", "Download_Status"]]
         .to_html(escape=False, index=False),
         unsafe_allow_html=True
     )
 
     # ===================== EXPORTS ===================== #
 
-    csv_data = df.drop(columns=["PDF_Link"]).to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download CSV Report",
-        csv_data,
-        "doi_oa_report.csv",
+        df.drop(columns=["PDF_Link"]).to_csv(index=False),
+        "oa_report.csv",
         "text/csv"
     )
 
@@ -227,7 +221,7 @@ if st.button("🔍 Check & Download PDFs"):
 st.markdown(
     """
     ---
-    **Sources:** Unpaywall • PubMed Central • Publisher OA  
-    **Compliance:** 100% Legal Open Access (No Sci-Hub / Anna’s Archive)
+    **Sources:** Unpaywall • PubMed Central  
+    **Compliance:** 100% Legal Open Access  
     """
 )
